@@ -1,0 +1,470 @@
+{
+  "name": "Memory Bot — выжимка + вопросы к беседе + API",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -880,
+        -40
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Узел: «Store & Route» (Telegram) ──────────────────────────────\n// Сохраняет каждое сообщение в долгую память воркфлоу и определяет,\n// что хочет пользователь.\n//   • Команды: /summary, /ask, /q (ответ ПО ИСТОРИИ), /chat (свободный вопрос\n//     ВНЕ контекста — ответ + сохраняем вопрос в память), /help.\n//   • Группы: то же + обращение через @упоминание бота или reply на его\n//     сообщение — тогда AI сам понимает по тексту, что нужно (выжимка/вопрос/мнение).\n//\n// 🔐 ИЗОЛЯЦИЯ: память разделена по chatId. У каждого чата (личка, группа A,\n// группа B …) своя отдельная история — они НЕ видят друг друга.\n\n// ─────────────────────────────────────────────────────────────────\n// ⚙️ НАСТРОЙКИ\n// Имя бота БЕЗ \"@\" (то, что после @ в его адресе). Нужно для распознавания\n// обращения в группах. Узнать: открой бота → его @username.\nconst BOT_USERNAME = 'ВАШ_БОТ_БЕЗ_СОБАКИ';\n\n// 🔒 ДОСТУП. Telegram ID тех, кому можно. /start покажет твой ID.\n// Пустой массив [] = доступ открыт всем.\nconst ALLOWED_USERS = [\n  // 123456789,\n];\n// ─────────────────────────────────────────────────────────────────\n\nconst incoming = $input.first().json;\nconst msg = incoming.message || incoming;\nconst text = (msg.text || '').trim();\nconst chatId = msg.chat && msg.chat.id;\nconst chatType = (msg.chat && msg.chat.type) || 'private';\nconst userId = msg.from && msg.from.id;\nconst userName =\n  (msg.from && (msg.from.first_name || msg.from.username)) || 'Unknown';\nconst date = new Date((msg.date || Date.now() / 1000) * 1000).toISOString();\n\n// Отдельное хранилище истории для КАЖДОГО чата (изоляция)\nconst data = $getWorkflowStaticData('global');\nif (!data.chats) data.chats = {};\nconst chatKey = String(chatId);\nif (!data.chats[chatKey]) data.chats[chatKey] = [];\n\nconst isCommand = text.startsWith('/');\nconst allowed = ALLOWED_USERS.length === 0 || ALLOWED_USERS.includes(userId);\n\n// Чужой пользователь: на команды/обращения — отказ, обычные сообщения тихо игнор.\nif (!allowed) {\n  if (isCommand) {\n    return [\n      {\n        json: {\n          intent: 'denied',\n          chatId,\n          reply:\n            '⛔ Это приватный бот.\\nТвой Telegram ID: ' +\n            userId +\n            '\\nПередай его владельцу, чтобы получить доступ.',\n          needsLLM: false,\n          hasReply: true,\n          historyCount: data.chats[chatKey].length,\n        },\n      },\n    ];\n  }\n  return [{ json: { intent: 'ignored', chatId, needsLLM: false, hasReply: false } }];\n}\n\n// ── Распознаём обращение в группе (@бот или reply на сообщение бота) ──\nconst isGroup = chatType === 'group' || chatType === 'supergroup';\nconst lower = text.toLowerCase();\nconst botTag = '@' + (BOT_USERNAME || '').toLowerCase();\nconst isMentioned = !!BOT_USERNAME && lower.includes(botTag);\nconst replyFrom = msg.reply_to_message && msg.reply_to_message.from;\nconst isReplyToBot = !!(\n  replyFrom &&\n  BOT_USERNAME &&\n  replyFrom.username &&\n  replyFrom.username.toLowerCase() === BOT_USERNAME.toLowerCase()\n);\nconst addressed = isGroup && (isMentioned || isReplyToBot);\n\nlet intent = 'store';\nlet question = '';\n\nif (lower === '/start' || lower === '/help') {\n  intent = 'help';\n} else if (lower.startsWith('/summary')) {\n  intent = 'summary';\n} else if (lower.startsWith('/ask')) {\n  intent = 'ask';\n  question = text.replace(/^\\/ask(@\\w+)?/i, '').trim();\n} else if (lower.startsWith('/q')) {\n  intent = 'ask';\n  question = text.replace(/^\\/q(@\\w+)?/i, '').trim();\n} else if (lower.startsWith('/chat')) {\n  intent = 'chat';\n  question = text.replace(/^\\/chat(@\\w+)?/i, '').trim();\n} else if (addressed) {\n  // Обращение без слэша: убираем упоминание и отдаём текст на «умную» обработку\n  const cleanText = BOT_USERNAME\n    ? text.replace(new RegExp('@' + BOT_USERNAME, 'ig'), '').trim()\n    : text;\n  if (cleanText) {\n    intent = 'smart';\n    question = cleanText;\n  }\n}\n\n// /ask или /chat без текста — покажем помощь\nif ((intent === 'ask' || intent === 'chat') && !question) intent = 'help';\n\n// Кладём в память ЭТОГО чата: обычное сообщение (text) ИЛИ вопрос из /chat (question)\nconst toStore = intent === 'store' ? text : intent === 'chat' ? question : '';\nif (toStore) {\n  data.chats[chatKey].push({ user: userName, text: toStore, date });\n  if (data.chats[chatKey].length > 500) {\n    data.chats[chatKey] = data.chats[chatKey].slice(-500);\n  }\n}\n\n// История ТОЛЬКО этого чата в виде текста для модели\nconst history = data.chats[chatKey];\nconst historyText = history\n  .map((h) => `[${h.date.slice(0, 16).replace('T', ' ')}] ${h.user}: ${h.text}`)\n  .join('\\n');\n\nlet systemPrompt = '';\nlet userPrompt = '';\nlet reply = '';\n\nif (intent === 'summary') {\n  systemPrompt =\n    'Ты — ассистент, который делает краткую структурированную выжимку из переписки в Telegram-чате. Отвечай на русском. Выдели блоки: 📌 Основные темы, ✅ Принятые решения, ❓ Открытые вопросы/задачи, 💬 Ключевые мнения участников.';\n  userPrompt = `Вот история переписки:\\n\\n${historyText || '(история пуста)'}\\n\\nСделай краткую выжимку.`;\n} else if (intent === 'ask') {\n  systemPrompt =\n    'Ты — ассистент с памятью о переписке в Telegram-чате. Отвечай ТОЛЬКО на основе предоставленной истории. Если в истории нет ответа — честно скажи, что в беседе это не обсуждалось. Отвечай на русском, кратко и по делу. Если спрашивают твоё мнение — дай его, опираясь на контекст беседы.';\n  userPrompt = `История переписки:\\n\\n${historyText || '(история пуста)'}\\n\\nВопрос: ${question}`;\n} else if (intent === 'smart') {\n  systemPrompt =\n    'Ты — ассистент с памятью о переписке в Telegram-чате. Пользователь обратился к тебе. Пойми по его сообщению, что нужно: если он просит выжимку/итоги/саммари беседы — сделай краткую структурированную выжимку (темы, решения, открытые вопросы, мнения). Иначе ответь на его вопрос или просьбу, опираясь ТОЛЬКО на историю беседы; если в истории нет ответа — честно скажи. Если просит мнение — дай его на основе контекста. Отвечай на русском, по делу.';\n  userPrompt = `История переписки:\\n\\n${historyText || '(история пуста)'}\\n\\nОбращение пользователя: ${question}`;\n} else if (intent === 'chat') {\n  systemPrompt =\n    'Ты — дружелюбный AI-ассистент. Отвечай на вопрос пользователя СВОБОДНО, как обычный AI, на любую тему — НЕ ограничивайся историей чата. Недавняя переписка дана ниже лишь как доп. контекст: используй её, только если это уместно. Отвечай на русском, по делу.';\n  userPrompt = `Доп. контекст (недавняя переписка):\\n\\n${historyText || '(пусто)'}\\n\\nВопрос пользователя: ${question}`;\n} else if (intent === 'help') {\n  reply =\n    '👋 Привет! Я приватный бот с памятью беседы.\\n\\n' +\n    'Твой Telegram ID: ' + userId + '\\n' +\n    'ID этого чата: ' + chatId + '\\n\\n' +\n    'Команды:\\n' +\n    '• /summary — выжимка этой беседы\\n' +\n    '• /ask <вопрос> — ответ ПО ИСТОРИИ беседы\\n' +\n    '• /q <вопрос> — то же, короче\\n' +\n    '• /chat <вопрос> — свободный вопрос ВНЕ контекста (ответ сохраняется в память)\\n\\n' +\n    'В группе можно и без команд — упомяни меня (@' +\n    (BOT_USERNAME || 'бот') +\n    ') или ответь (reply) на моё сообщение.\\n\\n' +\n    '🔐 У каждого чата своя отдельная память — беседы не пересекаются.\\n' +\n    `Сейчас в памяти этого чата: ${history.length} сообщений.`;\n}\n\nconst needsLLM =\n  intent === 'summary' || intent === 'ask' || intent === 'smart' || intent === 'chat';\nconst hasReply = reply !== '';\n\nreturn [\n  {\n    json: {\n      intent,\n      chatId,\n      question,\n      reply,\n      systemPrompt,\n      userPrompt,\n      needsLLM,\n      hasReply,\n      historyCount: history.length,\n    },\n  },\n];\n"
+      },
+      "id": "store-&-route",
+      "name": "Store & Route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -660,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "Нужен AI?-c1",
+              "leftValue": "={{ $json.needsLLM }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "нужен-ai?",
+      "name": "Нужен AI?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "YOUR_ANTHROPIC_API_KEY"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $vars && $vars.CLAUDE_MODEL ? $vars.CLAUDE_MODEL : 'claude-sonnet-4-6', max_tokens: 1500, system: $json.systemPrompt, messages: [ { role: 'user', content: $json.userPrompt } ], tools: [ { type: 'web_search_20250305', name: 'web_search', max_uses: 3 } ] }) }}",
+        "options": {}
+      },
+      "id": "claude-telegram-",
+      "name": "Claude (Telegram)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -180,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Узел: «Format reply» (Telegram) ───────────────────────────────\n// Достаёт текст из ответа Anthropic (собирает ВСЕ text-блоки — при веб-поиске\n// ответ приходит несколькими блоками) и тащит chatId/intent из Store & Route.\n// Для /chat дополнительно сохраняет ОТВЕТ бота в память чата.\n\nconst resp = $input.first().json;\n\n// Собираем итоговый текст из всех блоков типа \"text\" (поддержка веб-поиска)\nlet text = '';\ntry {\n  const c = resp.content;\n  if (Array.isArray(c)) {\n    text = c\n      .filter((b) => b && b.type === 'text' && b.text)\n      .map((b) => b.text)\n      .join('')\n      .trim();\n  }\n  if (!text) text = resp.completion || 'Не удалось получить ответ модели.';\n} catch (e) {\n  text = 'Ошибка разбора ответа модели.';\n}\n\nconst sr = $('Store & Route').first().json;\nconst chatId = sr.chatId;\n\n// Только для /chat: кладём ответ бота в память ЭТОГО чата\nif (sr.intent === 'chat' && chatId != null && text) {\n  const data = $getWorkflowStaticData('global');\n  if (!data.chats) data.chats = {};\n  const key = String(chatId);\n  if (!data.chats[key]) data.chats[key] = [];\n  data.chats[key].push({ user: 'Бот', text, date: new Date().toISOString() });\n  if (data.chats[key].length > 500) {\n    data.chats[key] = data.chats[key].slice(-500);\n  }\n}\n\nreturn [{ json: { reply: text, chatId } }];\n"
+      },
+      "id": "format-reply",
+      "name": "Format reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "Есть ответ?-c1",
+              "leftValue": "={{ $json.hasReply }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "есть-ответ?",
+      "name": "Есть ответ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -180,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {}
+      },
+      "id": "send-telegram",
+      "name": "Send Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        320,
+        -40
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ask",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "webhook-ask",
+      "name": "Webhook /ask",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        360
+      ],
+      "webhookId": "memory-bot-ask"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Узел: «API build prompt» (Webhook /ask) ───────────────────────\n// Принимает { \"question\": \"...\", \"chatId\": \"...\" } по HTTP, проверяет\n// секретный ключ и читает память КОНКРЕТНОГО чата (изоляция по chatId).\n// chatId узнаёшь в Telegram командой /start (бот покажет «ID этого чата»).\n\n// 🔒 Секретный ключ доступа к API. Клиент должен прислать его в заголовке\n// x-api-key ИЛИ в теле запроса как поле \"key\". Пустая строка = без проверки.\nconst API_KEY = 'CHANGE_ME_SECRET';\n\nconst root = $input.first().json || {};\nconst body = root.body || {};\nconst headers = root.headers || {};\nconst providedKey = (headers['x-api-key'] || body.key || '').toString();\n\nconst data = $getWorkflowStaticData('global');\nconst chats = data.chats || {};\n\n// Неверный ключ — дальше к модели не пускаем\nif (API_KEY && providedKey !== API_KEY) {\n  return [\n    {\n      json: {\n        error: true,\n        denied: true,\n        systemPrompt: '',\n        userPrompt: '',\n        question: '',\n        historyCount: 0,\n      },\n    },\n  ];\n}\n\n// Нужен chatId — иначе непонятно, память какой беседы отдавать (изоляция)\nconst chatKey = body.chatId != null ? String(body.chatId) : '';\nif (!chatKey) {\n  return [\n    {\n      json: {\n        error: true,\n        denied: false,\n        noChat: true,\n        systemPrompt: '',\n        userPrompt: '',\n        question: '',\n        historyCount: 0,\n      },\n    },\n  ];\n}\n\nconst history = chats[chatKey] || [];\nconst historyText = history\n  .map((h) => `[${h.date.slice(0, 16).replace('T', ' ')}] ${h.user}: ${h.text}`)\n  .join('\\n');\n\nconst question = (body.question || '').toString().trim();\nif (!question) {\n  return [\n    {\n      json: {\n        error: true,\n        denied: false,\n        systemPrompt: '',\n        userPrompt: '',\n        question: '',\n        historyCount: history.length,\n      },\n    },\n  ];\n}\n\nconst systemPrompt =\n  'Ты — ассистент с памятью о переписке. Отвечай на основе истории. Если ответа в истории нет — честно скажи об этом. Русский язык, кратко и по делу.';\nconst userPrompt = `История переписки:\\n\\n${historyText || '(история пуста)'}\\n\\nВопрос: ${question}`;\n\nreturn [\n  {\n    json: {\n      error: false,\n      denied: false,\n      systemPrompt,\n      userPrompt,\n      question,\n      historyCount: history.length,\n    },\n  },\n];\n"
+      },
+      "id": "api-build-prompt",
+      "name": "API build prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -640,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "API: доступ?-c1",
+              "leftValue": "={{ $json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "api:-доступ?",
+      "name": "API: доступ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Узел: «API error response» (Webhook /ask) ─────────────────────\n// Формирует JSON-ответ, когда доступ запрещён или вопрос пустой.\n\nconst j = $input.first().json || {};\nlet message = 'Поле \"question\" пустое.';\nif (j.denied) {\n  message = 'Доступ запрещён: неверный или отсутствует ключ (x-api-key / body.key).';\n} else if (j.noChat) {\n  message = 'Укажите \"chatId\" беседы. Узнать его: напиши боту /start в нужном чате.';\n}\n\nreturn [{ json: { error: true, message } }];\n"
+      },
+      "id": "api-error-response",
+      "name": "API error response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "YOUR_ANTHROPIC_API_KEY"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $vars && $vars.CLAUDE_MODEL ? $vars.CLAUDE_MODEL : 'claude-sonnet-4-6', max_tokens: 1500, system: $json.systemPrompt, messages: [ { role: 'user', content: $json.userPrompt } ], tools: [ { type: 'web_search_20250305', name: 'web_search', max_uses: 3 } ] }) }}",
+        "options": {}
+      },
+      "id": "claude-api-",
+      "name": "Claude (API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -220,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Узел: «API response» (Webhook /ask) ───────────────────────────\n// Формирует JSON-ответ для внешнего клиента (сайт, другое приложение).\n\nconst resp = $input.first().json;\n\n// Собираем текст из всех блоков \"text\" (поддержка веб-поиска)\nlet text = '';\nconst c = resp.content;\nif (Array.isArray(c)) {\n  text = c\n    .filter((b) => b && b.type === 'text' && b.text)\n    .map((b) => b.text)\n    .join('')\n    .trim();\n}\nif (!text) text = 'Нет ответа';\n\nconst meta = $('API build prompt').first().json;\n\nreturn [\n  {\n    json: {\n      answer: text,\n      question: meta.question,\n      historyCount: meta.historyCount,\n    },\n  },\n];\n"
+      },
+      "id": "api-response",
+      "name": "API response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        260,
+        360
+      ]
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Store & Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store & Route": {
+      "main": [
+        [
+          {
+            "node": "Нужен AI?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Нужен AI?": {
+      "main": [
+        [
+          {
+            "node": "Claude (Telegram)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Есть ответ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude (Telegram)": {
+      "main": [
+        [
+          {
+            "node": "Format reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format reply": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Есть ответ?": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Webhook /ask": {
+      "main": [
+        [
+          {
+            "node": "API build prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API build prompt": {
+      "main": [
+        [
+          {
+            "node": "API: доступ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API: доступ?": {
+      "main": [
+        [
+          {
+            "node": "API error response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Claude (API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API error response": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude (API)": {
+      "main": [
+        [
+          {
+            "node": "API response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API response": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

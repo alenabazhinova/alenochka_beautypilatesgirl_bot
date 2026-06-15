@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Memory Bot — спросить у беседы</title>
+  <style>
+    :root { --bg:#0f1115; --card:#1a1d24; --acc:#6c8cff; --txt:#e6e8ee; --mut:#8b90a0; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+           background:var(--bg); color:var(--txt); min-height:100vh;
+           display:flex; align-items:center; justify-content:center; padding:24px; }
+    .card { width:100%; max-width:560px; background:var(--card); border-radius:16px;
+            padding:28px; box-shadow:0 12px 40px rgba(0,0,0,.4); }
+    h1 { margin:0 0 4px; font-size:20px; }
+    p.sub { margin:0 0 20px; color:var(--mut); font-size:13px; }
+    label { display:block; font-size:12px; color:var(--mut); margin:14px 0 6px; }
+    input, textarea { width:100%; padding:12px 14px; border-radius:10px; border:1px solid #2a2e38;
+            background:#10131a; color:var(--txt); font-size:14px; font-family:inherit; }
+    textarea { min-height:80px; resize:vertical; }
+    button { margin-top:18px; width:100%; padding:13px; border:0; border-radius:10px;
+            background:var(--acc); color:#fff; font-size:15px; font-weight:600; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:default; }
+    .answer { margin-top:20px; padding:16px; border-radius:10px; background:#10131a;
+            border:1px solid #2a2e38; white-space:pre-wrap; font-size:14px; line-height:1.5; min-height:24px; }
+    .meta { margin-top:8px; font-size:11px; color:var(--mut); }
+    .err { color:#ff6b6b; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🧠 Memory Bot</h1>
+    <p class="sub">Спросите что угодно по сохранённой беседе. Запрос уходит в ваш n8n-webhook.</p>
+
+    <label>URL webhook (из ноды «Webhook /ask» в n8n)</label>
+    <input id="url" placeholder="https://&lt;ваш-туннель&gt;/webhook/ask" />
+
+    <label>Секретный ключ (x-api-key)</label>
+    <input id="key" type="password" placeholder="тот же, что в ноде «API build prompt»" />
+
+    <label>ID чата (из /start в нужном чате)</label>
+    <input id="chatId" placeholder="например 123456789 или -100123…" />
+
+    <label>Ваш вопрос</label>
+    <textarea id="q" placeholder="Например: о чём мы договорились по проекту? / какое твоё мнение?"></textarea>
+
+    <button id="go">Спросить</button>
+
+    <div class="answer" id="answer">Ответ появится здесь…</div>
+    <div class="meta" id="meta"></div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    // запоминаем URL и ключ между перезагрузками
+    $('url').value = localStorage.getItem('mb_url') || '';
+    $('key').value = localStorage.getItem('mb_key') || '';
+    $('chatId').value = localStorage.getItem('mb_chat') || '';
+    $('url').addEventListener('input', () => localStorage.setItem('mb_url', $('url').value));
+    $('key').addEventListener('input', () => localStorage.setItem('mb_key', $('key').value));
+    $('chatId').addEventListener('input', () => localStorage.setItem('mb_chat', $('chatId').value));
+
+    $('go').addEventListener('click', async () => {
+      const url = $('url').value.trim();
+      const key = $('key').value.trim();
+      const chatId = $('chatId').value.trim();
+      const question = $('q').value.trim();
+      const ans = $('answer'), meta = $('meta');
+      meta.textContent = '';
+      if (!url || !question) { ans.innerHTML = '<span class="err">Заполните URL и вопрос.</span>'; return; }
+      if (!chatId) { ans.innerHTML = '<span class="err">Укажите ID чата (узнай через /start в Telegram).</span>'; return; }
+      $('go').disabled = true; ans.textContent = 'Думаю…';
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': key },
+          body: JSON.stringify({ question, key, chatId }),
+        });
+        const data = await r.json();
+        ans.textContent = data.answer || JSON.stringify(data, null, 2);
+        if (data.historyCount != null) meta.textContent = 'В памяти беседы: ' + data.historyCount + ' сообщений';
+      } catch (e) {
+        ans.innerHTML = '<span class="err">Ошибка: ' + e.message +
+          '. Проверьте URL, что workflow активен, и CORS.</span>';
+      } finally {
+        $('go').disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
